@@ -1,0 +1,42 @@
+{
+    "chassis": {
+        "comment": "unit: meter",
+        "world_chassis_translate": [ 0, 0, 0 ],
+        "comment2": "xyz euler angle, in extrinsics convention, unit: radians",
+        "world_chassis_rotate": [ 0, 0, 0 ]
+    },
+    "imu": {
+        "chassis_imu_translate": [ 0, 0, 0 ],
+        "chassis_imu_rotate": [ 0, 0, 0 ],
+        "imu_rate": 400,
+        "enable": true
+    },
+    "lidar": {
+        "chassis_lidar_translate": [ 0, 0, 0.05 ],
+        "chassis_lidar_rotate": [ 0, 0, 0 ],
+        "lidar_config_file": "OS1_REV6_32ch10hz512res_noiseless",
+        "enable": true
+    },
+    "cameras": {
+        "chassis_cameras_translate": [ 0, 0, -0.05 ],
+        "chassis_cameras_rotate": [ 0, 0, 0 ],
+        "num_cameras": 3,
+        "camera_translate": [ [ 0.05, 0, 0 ], [ 0, 0.05, 0 ], [ 0, -0.05, 0 ] ],
+        "camera_rotate": [ [ -90.0, 0.0, -90.0 ], [ -90.0, 0.0, 0 ], [ -90.0, 0.0, -180.0 ] ],
+        "camera_axes": "ros",
+        "camera_fps": 10,
+        "calibrate_config": {
+            "use_intrinsics": false,
+            "camera_resolution": [ 1920, 1200 ],
+            "camera_intrinsics": [ [ 960, 0.0, 960 ], [ 0.0, 960, 600 ], [ 0.0, 0.0, 1.0 ] ],
+            "camera_intrinsics_comment": "fx, 0, cx, 0, fy, cy, 0, 0, 1, in pixel unit",
+            "pixel_size_mm": 0.003,
+            "f_stop": 0,
+            "f_stop_comment": "set to 0 to turn off focusing/blurring effect",
+            "focus_distance_m": 0.6,
+            "focal_length_mm": 5,
+            "horizontal_fov_deg": 99
+        },
+        "enable": true
+    }
+}

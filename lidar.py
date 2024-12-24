@@ -13,9 +13,13 @@ from omni.isaac.core.utils.prims import *
 from omni.isaac.IsaacSensorSchema import IsaacRtxLidarSensorAPI
 import omni.replicator.core as rep
 import omni.syntheticdata._syntheticdata as _syntheticdata
+from omni.isaac.core_nodes.bindings import _omni_isaac_core_nodes
 
-import numpy as np
 from rotations import *
+import numpy as np
+from scipy.interpolate import interp1d
+from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Slerp
 
 
 class RtxLidar(BaseSensor):
@@ -25,7 +29,7 @@ class RtxLidar(BaseSensor):
     - connect acquisition callback to stage rendering event instead of update event
     - add buffering option to buffer frames and return them in a single callback
     TODO: it only works if simulation rate is the same as rotation rate.
-    For example if lidar is 10Hz and sim render at 30fps the point cloud will fail
+    For example if lidar is 10Hz and sim render at 30fps the point cloud will have error
     """
 
     def __init__(
@@ -46,6 +50,7 @@ class RtxLidar(BaseSensor):
 
         self._render_product_path = None
         self._render_event_sub = None
+        self._physics_sub = None
         self._og_controller = None
         self._sdg_graph_pipeline = None
         self._sdg_interface = None
@@ -65,6 +70,8 @@ class RtxLidar(BaseSensor):
 
         self._current_frames = {}
         self._clear_current_frames()
+        self._poses = []
+        self._last_frame_time = 0.0
 
         self._create_rtx_lidar_sensor(prim_path, config_file_name)
         BaseSensor.__init__(
@@ -80,6 +87,10 @@ class RtxLidar(BaseSensor):
     def __del__(self):
         if self._render_event_sub is not None:
             self._render_event_sub.unsubscribe()
+            del self._render_event_sub
+        if self._physics_sub is not None:
+            self._physics_sub.unsubscribe()
+            del self._physics_sub
 
     def _read_config(self, config_file_name):
         config_path = os.path.abspath(
@@ -99,9 +110,11 @@ class RtxLidar(BaseSensor):
         return config
 
     def _clear_current_frames(self):
+        self._current_frames = {}
         keys = self._frame_keys + ['rendering_time', 'xyz']
         for k in keys:
-            self._current_frames[k] = []
+            self._current_frames[k] = None
+        self._current_frames['poses'] = []
 
     @property
     def config(self):
@@ -138,35 +151,27 @@ class RtxLidar(BaseSensor):
             "IsaacReadTimes")
         self._time_annotator.attach([self._render_product_path])
 
-        # self._print_writer = rep.WriterRegistry.get(
-        #     "WriterIsaacPrintRTXSensorInfo")
-        # self._print_writer.attach([self._render_product_path])
-
-        # self._render_event_sub = (
-        #     omni.usd.get_context()
-        #     .get_rendering_event_stream()
-        #     .create_subscription_to_pop_by_type(
-        #         int(omni.usd.StageRenderingEventType.NEW_FRAME),
-        #         self._data_acquisition_callback,
-        #         name="my.rtx.lidar.data.acquisition",
-        #         order=1000,
-        #     )
-        # )
         self._render_event_sub = (
             omni.usd.get_context()
             .get_rendering_event_stream()
-            .create_subscription_to_pop(
-                self._data_acquisition_callback
+            .create_subscription_to_pop_by_type(
+                int(omni.usd.StageRenderingEventType.NEW_FRAME),
+                self._data_acquisition_callback,
+                name="my.rtx.lidar.data.acquisition",
+                order=1000,
             )
         )
-        self._events = []
+
+        self._physx_interface = omni.physx.acquire_physx_interface()
+        self._physics_sub = self._physx_interface.subscribe_physics_step_events(
+            self._add_poses_cb)
+        self._core_nodes_interface = _omni_isaac_core_nodes.acquire_interface()
 
         self._og_controller = og.Controller()
         self._sdg_graph_pipeline = "/Render/PostProcess/SDGPipeline"
         self._sdg_interface = _syntheticdata.acquire_syntheticdata_interface()
 
     def _data_acquisition_callback(self, event):
-        self._events.append(event)
         parsed_payload = self._sdg_interface.parse_rendered_simulation_event(
             event.payload["product_path_handle"], event.payload["results"]
         )
@@ -184,36 +189,47 @@ class RtxLidar(BaseSensor):
 
         time_data = self._time_annotator.get_data()
         rendering_time = time_data['simulationTime']
-        self._current_frames['rendering_time'].append(rendering_time)
+        self._current_frames['rendering_time'] = rendering_time
         for key in self._frame_keys:
             if key in ['transform', 'transformStart']:
                 transform = lidar_data[key].reshape(4, 4).T
-                self._current_frames[key].append(transform)
+                self._current_frames[key] = transform
             else:
-                self._current_frames[key].append(lidar_data[key])
+                self._current_frames[key] = lidar_data[key]
 
         point_cloud = _calculate_xyz(lidar_data, degrees=True)
-        self._current_frames['xyz'].append(point_cloud)
+        self._current_frames['xyz'] = point_cloud
+        frame_poses, remaining_poses = self._get_poses_list(
+            self._poses, self._last_frame_time, rendering_time)
+        self._current_frames['poses'] = frame_poses
+        self._poses = remaining_poses
 
-        if self._buffering:
-            self._check_buffer()
+        pcd = redistort(self._current_frames)
+        transform_start = pose_to_transform(frame_poses[0][1:])
+        transform = pose_to_transform(frame_poses[-1][1:])
+        self._current_frames['transformStart'] = transform_start
+        self._current_frames['transform'] = transform
+        self._current_frames['xyz'] = pcd
 
-    def _check_buffer(self):
-        if self._buffer_cb is None:
-            return
-
-        dt = SimulationContext.instance().get_rendering_dt()
-        steps_per_second = int(1/dt)
-        frames_per_second = int(self.rotation_hz)
-        if steps_per_second % frames_per_second != 0:
-            raise ValueError("frame time must be a multiple of render step")
-        steps_per_frame = steps_per_second // frames_per_second
-        if len(self._current_frames['rendering_time']) >= steps_per_frame:
-            result = {}
-            for key, _ in self._current_frames.items():
-                result[key] = self._current_frames[key][:steps_per_frame]
-                self._current_frames[key] = self._current_frames[key][steps_per_frame:]
+        if self._buffer_cb:
+            result = self._current_frames
+            self._clear_current_frames()
             self._buffer_cb(result)
+
+    def _add_poses_cb(self, stepsize):
+        position, orientation = self.get_world_pose()
+        time = self._core_nodes_interface.get_sim_time()
+        self._poses.append((time, position, orientation))
+
+    def _get_poses_list(self, poses, last_frame_time, current_time):
+        """
+        the lidar NEW_FRAME are not sync with rendering loop so its not guaranteed that the recorded poses 
+        are in the frame boundary. so we manually slice the poses list using the frame time
+        """
+        frame_poses = [p for p in poses if p[0] >=
+                       last_frame_time and p[0] <= current_time]
+        remaining = [p for p in poses if p[0] > current_time]
+        return frame_poses, remaining
 
     def consume_current_frames(self):
         """
@@ -223,32 +239,12 @@ class RtxLidar(BaseSensor):
         self._current_frames = {}
         return frames
 
-    def set_buffering(self, buffering=False, buffer_cb=None):
+    def set_callback(self, buffer_cb=None):
         """
         Args:
-            buffering: whether to buffer frames
             buffer_cb: callback function when lidar finishes a full revolution
         """
-        self._buffering = buffering
         self._buffer_cb = buffer_cb
-
-
-def _linear_interpolate(xp, yp, x):
-    if yp.shape[0] != xp.shape[0]:
-        raise ValueError("xp and yp must have the same length")
-    yp_shape = yp.shape
-    yp = yp.reshape(yp_shape[0], -1).T
-    y = np.array([np.interp(x, xp, ypi) for ypi in yp]).T
-    y = y.reshape(-1, *yp_shape[1:])
-    return y
-
-
-def _to_world(pcd, transform):
-    return np.matmul(transform[:3, :3], pcd.T).T + transform[:3, 3]
-
-
-def _to_sensor(pcd, transform):
-    return np.matmul(transform[:3, :3].T, (pcd - transform[:3, 3]).T).T
 
 
 def _calculate_xyz(frame, degrees=False, filtered=False):
@@ -270,46 +266,94 @@ def _calculate_xyz(frame, degrees=False, filtered=False):
     return points
 
 
-def undistort(pcd, transforms):
+def _to_sensor(pcd, transform):
+    return np.matmul(transform[:3, :3].T, (pcd - transform[:3, 3]).T).T
+
+
+def _to_world(pcd, transform):
+    return np.matmul(transform[:3, :3], pcd.T).T + transform[:3, 3]
+
+
+def undistort(pcd, poses):
     """
-    The Isaac RTX Lidar sensor seems to model the distortion for half of the frame
-    So we undistort the first half and use the last transformation for the second half
-    If the transformation at the beginning and end of the frame are the same, we skip 
-    the interpolation and simply move it to world frame
+    undistort point cloud in sensor frame to world frame
     Args:
         pcd: point cloud in sensor frame
-        transforms: [transformStart, transformEnd] pose of lidar when capture first and last point.
+        poses: list of poses [time, translation, quaternion(wxyz)]
     Return:
-        undistorted point cloud in sensor frame (transformEnd)
+        undistorted point cloud in world frame
     """
-    if np.allclose(transforms[0], transforms[1]):
-        return pcd
 
-    positions = np.array([t[:3, 3] for t in transforms])
-    rotations = np.array([t[:3, :3] for t in transforms])
-    angles = np.array([matrix_to_euler_angles(r) for r in rotations])
-    pi = np.pi
-    angles_changes = angles[1] - angles[0]
-    # assuming during one scan, the frame rotate in the shorter direction
-    angles_changes[angles_changes > pi] -= 2*pi
-    angles_changes[angles_changes < -pi] += 2*pi
-    angles[1] = angles[0] + angles_changes
+    times = np.array([p[0] for p in poses])
+    trans = np.array([p[1] for p in poses])
+    quats = np.array([p[2] for p in poses])
+    quats = wxyz2xyzw(quats)
+
+    point_times = np.linspace(times[0], times[-1], len(pcd))
+    f = interp1d(times, trans, axis=0)
+    trans = f(point_times)
+
+    slerp = Slerp(times, R.from_quat(quats))
+    rotations = slerp(point_times).as_matrix()
+
+    pcd_world = np.matmul(rotations, pcd[..., None]).squeeze() + trans
+    return pcd_world
+
+
+def distort(pcd_world, poses):
+    """
+    distort a pointcloud in world frame to sensor frame
+    Args:
+        pcd_world: point cloud in world frame
+        poses: list of poses [time, translation, quaternion(wxyz)]
+    Return:
+        distorted point cloud in sensor frame
+    """
+    times = np.array([p[0] for p in poses])
+    trans = np.array([p[1] for p in poses])
+    quats = np.array([p[2] for p in poses])
+    quats = wxyz2xyzw(quats)
+
+    point_times = np.linspace(times[0], times[-1], len(pcd_world))
+    f = interp1d(times, trans, axis=0)
+    trans = f(point_times)
+
+    f = Slerp(times, R.from_quat(quats))
+    rotations_inv = f(point_times).inv().as_matrix()
+
+    pcd_sensor = np.matmul(
+        rotations_inv, (pcd_world - trans)[..., None]).squeeze()
+    return pcd_sensor
+
+
+def transform_to_pose(transform):
+    position = transform[:3, 3]
+    rotation = transform[:3, :3]
+    quat = rot_matrix_to_quat(rotation)
+    return (position, quat)
+
+
+def pose_to_transform(pose):
+    position, quat = pose
+    rotation = quat_to_rot_matrix(quat)
+    transform = np.eye(4)
+    transform[:3, 3] = position
+    transform[:3, :3] = rotation
+    return transform
+
+
+def redistort(isaac_frame):
+    p0, q0 = transform_to_pose(isaac_frame['transformStart'])
+    p1, q1 = transform_to_pose(isaac_frame['transform'])
+    poses = [[0, p0, q0], [1, p1, q1]]
+    # only undistort half of the points
+    pcd = isaac_frame['xyz']
     pcd1 = pcd[:len(pcd)//2]
     pcd2 = pcd[len(pcd)//2:]
-    timestamps = np.array([0, 1])
-    times = np.linspace(timestamps[0], timestamps[-1], len(pcd1))
-
-    pos_interpolated = _linear_interpolate(
-        timestamps, positions, times)
-    angles_interpolated = _linear_interpolate(
-        timestamps, angles, times)
-    rot_interpolated = np.array([euler_to_rot_matrix(a)
-                                for a in angles_interpolated])
-    # rot_interpolated = _linear_interpolate(
-    #     timestamps, rotations, times)
-    pcd1 = np.expand_dims(pcd1, axis=-1)
-    pcd1_undistorted = np.squeeze(
-        np.matmul(rot_interpolated, pcd1)) + pos_interpolated
-    pcd1_undistorted = _to_sensor(pcd1_undistorted, transforms[-1])
-    pcd2_undistorted = pcd2
-    return np.concatenate([pcd1_undistorted, pcd2_undistorted])
+    pcd1_world = undistort(pcd1, poses)
+    pcd2_world = _to_world(pcd2, isaac_frame['transform'])
+    pcd_world = np.concatenate([pcd1_world, pcd2_world])
+    print(len(isaac_frame['poses']))
+    poses = isaac_frame['poses']
+    pcd_sensor = distort(pcd_world, poses)
+    return pcd_sensor
